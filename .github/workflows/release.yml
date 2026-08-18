@@ -1,0 +1,92 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      py_tag:
+        description: "Python base tag (e.g. 3.12-slim, 3.13-slim, 3.14-slim)"
+        required: true
+        default: "3.12-slim"
+      ta_lib_version:
+        description: "TA-Lib release tag (no leading v)"
+        required: true
+        default: "0.6.3"
+      rev:
+        description: "Force a specific rev number (else auto-bump)"
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tag and rev
+        id: meta
+        run: |
+          PY_TAG="${{ github.event.inputs.py_tag || '3.12-slim' }}"
+          TA_LIB_VER="${{ github.event.inputs.ta_lib_version || '0.6.3' }}"
+          REV_FILE="slim/VERSIONS"
+          [[ -f "$REV_FILE" ]] || echo "0" > "$REV_FILE"
+          FORCED="${{ github.event.inputs.rev }}"
+          if [[ -n "$FORCED" ]]; then
+            REV="$FORCED"
+          else
+            REV=$(( $(cat "$REV_FILE") + 1 ))
+          fi
+          echo "tag=${PY_TAG}-talib${TA_LIB_VER}-r${REV}" >> "$GITHUB_OUTPUT"
+          echo "rev=${REV}" >> "$GITHUB_OUTPUT"
+          echo "py=${PY_TAG}" >> "$GITHUB_OUTPUT"
+          echo "talib=${TA_LIB_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: slim/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            PYTHON_TAG=${{ steps.meta.outputs.py }}
+            TA_LIB_VERSION=${{ steps.meta.outputs.talib }}
+            CREATED_AT=${{ github.event.head_commit.timestamp }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:stable
+
+      - name: Mirror to Docker Hub
+        if: env.DH_USERNAME != ''
+        env:
+          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "$DH_PASSWORD" | docker login -u "$DH_USERNAME" --password-stdin
+          docker buildx imagetools create \
+            -t danazkari/python-talib-slim:${{ steps.meta.outputs.tag }} \
+            -t danazkari/python-talib-slim:stable \
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ steps.meta.outputs.tag }}
+
+      - name: Bump slim/VERSIONS
+        run: |
+          echo "${{ steps.meta.outputs.rev }}" > slim/VERSIONS
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add slim/VERSIONS
+          git diff --staged --quiet || git commit -m "release: bump slim base rev to r${{ steps.meta.outputs.rev }}"
+          git push

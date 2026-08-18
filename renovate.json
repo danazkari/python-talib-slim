@@ -1,0 +1,22 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["slim/Dockerfile"],
+      "matchStrings": [
+        "ARG TA_LIB_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "https://github.com/TA-Lib/ta-lib/releases/download/v(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "TA-Lib/ta-lib"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDatasources": ["github-releases"],
+      "labels": ["dependency", "ta-lib"]
+    }
+  ]
+}
