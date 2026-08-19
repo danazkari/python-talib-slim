@@ -22,13 +22,16 @@ permissions:
   packages: write
 
 jobs:
-  build:
+  meta:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      rev: ${{ steps.meta.outputs.rev }}
+      py: ${{ steps.meta.outputs.py }}
+      talib: ${{ steps.meta.outputs.talib }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Compute tag and rev
-        id: meta
+      - id: meta
         run: |
           PY_TAG="${{ github.event.inputs.py_tag || '3.12-slim' }}"
           TA_LIB_VER="${{ github.event.inputs.ta_lib_version || '0.6.3' }}"
@@ -45,6 +48,20 @@ jobs:
           echo "py=${PY_TAG}" >> "$GITHUB_OUTPUT"
           echo "talib=${TA_LIB_VER}" >> "$GITHUB_OUTPUT"
 
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -55,22 +72,42 @@ jobs:
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push to GHCR
+      - name: Build and push per-arch to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
           file: slim/Dockerfile
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           push: true
           build-args: |
-            PYTHON_TAG=${{ steps.meta.outputs.py }}
-            TA_LIB_VERSION=${{ steps.meta.outputs.talib }}
+            PYTHON_TAG=${{ needs.meta.outputs.py }}
+            TA_LIB_VERSION=${{ needs.meta.outputs.talib }}
             CREATED_AT=${{ github.event.head_commit.timestamp }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ steps.meta.outputs.tag }}
-            ghcr.io/${{ github.repository_owner }}/python-talib-slim:stable
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ needs.meta.outputs.tag }}-${{ matrix.platform }}
 
-      - name: Mirror to Docker Hub
+  manifest:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construct multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ needs.meta.outputs.tag }} \
+            -t ghcr.io/${{ github.repository_owner }}/python-talib-slim:slim-talib${{ needs.meta.outputs.talib }}-py${{ needs.meta.outputs.py }} \
+            -t ghcr.io/${{ github.repository_owner }}/python-talib-slim:stable \
+            \
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ needs.meta.outputs.tag }}-linux-amd64 \
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ needs.meta.outputs.tag }}-linux-arm64
+
+      - name: Mirror multi-arch manifest to Docker Hub
         if: env.DH_USERNAME != ''
         env:
           DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -78,15 +115,22 @@ jobs:
         run: |
           echo "$DH_PASSWORD" | docker login -u "$DH_USERNAME" --password-stdin
           docker buildx imagetools create \
-            -t danazkari/python-talib-slim:${{ steps.meta.outputs.tag }} \
+            -t danazkari/python-talib-slim:${{ needs.meta.outputs.tag }} \
             -t danazkari/python-talib-slim:stable \
-            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ steps.meta.outputs.tag }}
+            \
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ needs.meta.outputs.tag }}-linux-amd64 \
+            ghcr.io/${{ github.repository_owner }}/python-talib-slim:${{ needs.meta.outputs.tag }}-linux-arm64
 
+  bump:
+    needs: [meta, manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Bump slim/VERSIONS
         run: |
-          echo "${{ steps.meta.outputs.rev }}" > slim/VERSIONS
+          echo "${{ needs.meta.outputs.rev }}" > slim/VERSIONS
           git config user.name "release-bot"
           git config user.email "release-bot@users.noreply.github.com"
           git add slim/VERSIONS
-          git diff --staged --quiet || git commit -m "release: bump slim base rev to r${{ steps.meta.outputs.rev }}"
+          git diff --staged --quiet || git commit -m "release: bump slim base rev to r${{ needs.meta.outputs.rev }}"
           git push
